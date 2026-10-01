@@ -2396,9 +2396,16 @@ sub HM485_ChannelDoUpdate($$$$) {
 	# is this for the central or does it go somewhere else?
 	my $targetName = undef;
 	if($target and $target ne "FFFFFFFF" and $target ne $chHash->{devHash}{IODev}{hmwId}) {
-        # target is some device
-		$targetName = HM485::PeeringManager::getDevNameByHmwId($target);
-		$updateState = 0;
+        # target is some device - but only suppress our own reading update if this
+        # actually resolves to a real, currently defined FHEM device. HM-Wired uses
+        # several broadcast/group addresses besides FFFFFFFF (e.g. FF000001, FFFFFF01)
+        # which getDevNameByHmwId can't resolve (returns "unknown_<id>"), which wrongly
+        # suppressed the channel's own state/working/level updates - fixed 2026-08-19.
+		my $resolvedName = HM485::PeeringManager::getDevNameByHmwId($target);
+		if ($resolvedName !~ /^unknown_/) {
+			$targetName = $resolvedName;
+			$updateState = 0;
+		}
 	};	
 	
 	readingsBeginUpdate($chHash);
