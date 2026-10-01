@@ -88,6 +88,14 @@ sub HM485_ProcessEepromData($$$);
 # External helper functions
 sub HM485_DevStateIcon($);
 
+# Cyclic state query (attribute stateInterval)
+sub HM485_StateIntervalConfigured($);
+sub HM485_ChannelHasStateGet($);
+sub HM485_StateIntervalUpdate($);
+sub HM485_StateIntervalArm(;$);
+sub HM485_StateIntervalQuery($$);
+sub HM485_StateIntervalTick($);
+
 #Message queues
 sub HM485_GetNewMsgQueue($$$$$);
 sub HM485_QueueStepFailed($$);
@@ -99,6 +107,14 @@ my $defStart = 5;
 # List of "message queues" for e.g. reading config 
 my @msgQueueList = ();
 my $currentQueueIndex = -1; #index of current queue
+
+# Cyclic state query (attribute stateInterval)
+# All channels share one timer, which sends at most one query
+# per $stateIntervalGap seconds.
+my %stateIntervalDue = ();        # hmwId_chNr => time of next state query
+my $stateIntervalGap = 2;         # minimum seconds between two queries
+my $stateIntervalMin = 10;        # minimum value of attribute stateInterval
+my $stateIntervalTimer = 'HM485::StateIntervalTimer';
 
 
 # Helper function to set a single reading asynchronously
@@ -132,6 +148,7 @@ sub HM485_Initialize($) {
 	$hash->{'ParseFn'}        = 'HM485_Parse';
 	$hash->{'SetFn'}          = 'HM485_Set';
 	$hash->{'GetFn'}          = 'HM485_Get';
+	$hash->{'AttrFn'}         = 'HM485_Attr';
 	
 	# For FHEMWEB
 	$hash->{'FW_detailFn'}    = 'HM485_FhemwebShowConfig';
@@ -142,6 +159,7 @@ sub HM485_Initialize($) {
 
 	my $attrlist = 'autoReadConfig:atstartup,always,never '. 
 							  'configReadRetries '.	
+							  'stateInterval '.
 							  'subType '.
 							  'do_not_notify:0,1 ' .
 	                          'ignore:1,0 dummy:1,0 showtime:1,0 ' .
@@ -283,6 +301,9 @@ sub HM485_Define($$) {
 		$hash->{device}    = $devName;                  # reference this channel to the device entity
 		$hash->{devHash} = $devHash;
 		$hash->{chanNo}    = $chNr;						# reference the device to this channel
+		# device might have stateInterval set
+		HM485::Util::PQadd(\&HM485_StateIntervalUpdate, [$hash])
+			if(AttrVal($devName, 'stateInterval', 0));
 	} else {
 		# We defined the device
 		# if there is an IODevice in the define, we can directly assign it
@@ -361,6 +382,10 @@ sub HM485_Undefine($$) {
 		} 
 	}
 	delete($modules{HM485}{defptr}{$hmwid});
+	# no more cyclic state queries
+	if(defined(delete($stateIntervalDue{$hmwid}))) {
+		HM485_StateIntervalArm();
+	}
 	return undef;
 }
 
@@ -386,6 +411,8 @@ sub HM485_Rename($$) {
 		HM485_RefreshPeersCache($hash);
 		# refresh own cache
 		HM485_RefreshCache($devHash);
+		# cyclic state queries (stateInterval) are keyed by hmwId,
+		# so there is nothing to move
 	} else{
 		# we are a device - inform channels if exist
 		foreach my $devName ( grep(/^channel_/, keys %{$hash})) {
@@ -918,6 +945,35 @@ sub HM485_Get($@) {
 	}
 
 	return $msg;
+}
+
+
+=head2
+	Implements AttrFn function
+	
+	@param	string	command (set or del)
+	@param	string	name of device
+	@param	string	name of attribute
+	@param	string	value of attribute
+	
+	@return	undef | error message
+=cut
+sub HM485_Attr($$$$) {
+	my ($cmd, $name, $attrName, $val) = @_;
+	my $hash = $defs{$name};
+	return undef unless($hash);
+	
+	if($attrName eq 'stateInterval') {
+		if($cmd eq 'set') {
+			return 'stateInterval is not available for virtual devices'
+				if($hash->{virtual} || ($hash->{devHash} && $hash->{devHash}{virtual}));
+			return 'stateInterval must be 0 (off) or a number of seconds >= '.$stateIntervalMin
+				unless(defined($val) && $val =~ m/^\d+$/ && ($val == 0 || $val >= $stateIntervalMin));
+		};
+		# attribute is not yet stored, so do it afterwards
+		HM485::Util::PQadd(\&HM485_StateIntervalUpdate, [$hash]);
+	}
+	return undef;
 }
 
 
@@ -2075,6 +2131,139 @@ sub HM485_ProcessResponse($$$) {
 	delete ($ioHash->{'.waitForResponse'}{$msgId});
 }
 
+
+###############################################################################
+# Cyclic state query (attribute stateInterval)
+###############################################################################
+
+# Configured interval of a channel
+# The attribute of the channel wins over the attribute of the device.
+# Returns (interval, set at channel)
+sub HM485_StateIntervalConfigured($) {
+	my ($chHash) = @_;
+	my $devHash = $chHash->{devHash};
+	return (0, 0) if(!$devHash || $devHash->{virtual});
+	my $interval = AttrVal($chHash->{NAME}, 'stateInterval', undef);
+	my $explicit = defined($interval) ? 1 : 0;
+	$interval = AttrVal($devHash->{NAME}, 'stateInterval', 0) unless($explicit);
+	$interval = 0 unless(looks_like_number($interval) && $interval > 0);
+	return ($interval, $explicit);
+}
+
+
+# Can the channel report its state on request (LEVEL_GET)?
+# This is used when the attribute is inherited from the device
+sub HM485_ChannelHasStateGet($) {
+	my ($chHash) = @_;
+	my $deviceKey = HM485::Device::getDeviceKeyFromHash($chHash);
+	return 0 unless($deviceKey);
+	my $chType = HM485::Device::getChannelType($deviceKey, $chHash->{chanNo});
+	return 0 unless($chType);
+	my ($behaviour, $bool, $role) = HM485::Device::getChannelBehaviour($chHash);
+	if ($role && $role eq 'switch') {
+		$behaviour = $role .'_ch';
+	}
+	my $valuePrafix = $bool ? '/subconfig/paramset/hmw_'. $behaviour. 
+		'_values/parameter' : '/paramset/values/parameter/';
+	my $values = HM485::Device::getValueFromDefinitions(
+		$deviceKey . '/channels/' . $chType . $valuePrafix
+	);
+	return 0 unless(ref($values) eq 'ARRAY');
+	foreach my $value (@{$values}) {
+		my $physical = $value->{physical};
+		foreach my $phys (ref($physical) eq 'ARRAY' ? @{$physical} : ($physical)) {
+			return 1 if(ref($phys) eq 'HASH' && defined($phys->{get}));
+		}
+	}
+	return 0;
+}
+
+
+# (Re-)Schedule the state queries of a channel or of all channels of a device
+# Called (via PQadd) when the attribute is changed or a channel is defined
+sub HM485_StateIntervalUpdate($) {
+	my ($hash) = @_;
+	# device might have been deleted in the meantime
+	return unless($hash->{DEF} && $modules{HM485}{defptr}{$hash->{DEF}}
+	              && $modules{HM485}{defptr}{$hash->{DEF}} == $hash);
+	my @channels = $hash->{devHash} ? ($hash) 
+	             : map { $defs{$hash->{$_}} } grep(/^channel_/, keys %{$hash});
+	my $now = gettimeofday();
+	foreach my $chHash (@channels) {
+		next unless($chHash && $chHash->{devHash});
+		my ($interval) = HM485_StateIntervalConfigured($chHash);
+		if($interval) {
+			# random start to spread the queries over the interval
+			$stateIntervalDue{$chHash->{DEF}} = $now + $stateIntervalGap + rand($interval);
+			HM485::Util::Log3($chHash, 4, 'stateInterval: query state every '.$interval.'s');
+		}else{
+			delete $stateIntervalDue{$chHash->{DEF}};
+		}
+	}
+	HM485_StateIntervalArm();
+}
+
+
+# Set the timer to the next due query, but not before $notBefore
+sub HM485_StateIntervalArm(;$) {
+	my ($notBefore) = @_;
+	RemoveInternalTimer($stateIntervalTimer);
+	my $next;
+	foreach my $due (values %stateIntervalDue) {
+		$next = $due if(!defined($next) || $due < $next);
+	}
+	return unless(defined($next));
+	$next = $notBefore if(defined($notBefore) && $next < $notBefore);
+	InternalTimer($next, 'HM485_StateIntervalTick', $stateIntervalTimer, 0);
+}
+
+
+# Query the state of one channel, like "get <channel> state"
+# returns 1 if something has been sent
+sub HM485_StateIntervalQuery($$) {
+	my ($id, $now) = @_;
+	my $chHash = $modules{HM485}{defptr}{$id};
+	my ($interval, $explicit) = $chHash ? HM485_StateIntervalConfigured($chHash) : (0, 0);
+	if(!$interval) {
+		delete $stateIntervalDue{$id};
+		return 0;
+	}
+	$stateIntervalDue{$id} = $now + $interval;
+	my $devHash = $chHash->{devHash};
+	# disabled, dummy or ignored channel or device
+	foreach my $n ($chHash->{NAME}, $devHash->{NAME}) {
+		return 0 if(AttrVal($n, 'disable', 0) || AttrVal($n, 'dummy', 0) || AttrVal($n, 'ignore', 0));
+	}
+	# keep quiet if the bus is not available
+	my $ioHash = $devHash->{IODev};
+	return 0 unless($ioHash && defined($ioHash->{STATE}) && $ioHash->{STATE} eq 'opened');
+	# not while the device configuration is (re-)read
+	return 0 unless(ReadingsVal($devHash->{NAME}, 'configStatus', '') eq 'OK');
+	# inherited from the device: only channels which can report their state
+	if(!$explicit && !HM485_ChannelHasStateGet($chHash)) {
+		HM485::Util::Log3($chHash, 4, 'stateInterval: channel cannot report its state, ignored');
+		delete $stateIntervalDue{$id};
+		return 0;
+	}
+	my ($hmwId, $chNr) = HM485::Util::getHmwIdAndChNrFromHash($chHash);
+	HM485::Util::Log3($chHash, 5, 'stateInterval: query state');
+	HM485_SendCommand($chHash, $hmwId, sprintf ('53%02X', $chNr-1));  # Channel als hex- Wert
+	return 1;
+}
+
+
+# Timer: query the channel which is due longest
+sub HM485_StateIntervalTick($) {
+	my $now = gettimeofday();
+	my $sent = 0;
+	foreach my $id (sort { $stateIntervalDue{$a} <=> $stateIntervalDue{$b} } keys %stateIntervalDue) {
+		last if($stateIntervalDue{$id} > $now);
+		$sent = HM485_StateIntervalQuery($id, $now);
+		last if($sent);
+	}
+	HM485_StateIntervalArm($sent ? $now + $stateIntervalGap : undef);
+}
+
 =head2
 	Notify the device if we got a nack
 	
@@ -2789,7 +2978,8 @@ sub HM485_QueueStepFailed($$) {
 		<br>
 		<ul>
 		<li><code>get &lt;channel&gt; <b>state</b></code><br>
-		This command updates the state of a channel, if possible. Technically, it sends a request to the device to send back the state of the channel. This is usually only implemented by actor channels. In this case, the readings <code>state</code> and other readings showing the channel's state are updated (like e.g. <code>working</code> and <code>level</code> for shutter actors). 
+		This command updates the state of a channel, if possible. Technically, it sends a request to the device to send back the state of the channel. This is usually only implemented by actor channels. In this case, the readings <code>state</code> and other readings showing the channel's state are updated (like e.g. <code>working</code> and <code>level</code> for shutter actors).<br>
+		To do this regularly, use the attribute <code>stateInterval</code>.
 		</li>
 		<br>
 		<li><code>get &lt;device/channel&gt; <b>config</b></code><br>
@@ -2867,6 +3057,17 @@ sub HM485_QueueStepFailed($$) {
 			It is possible to change <code>configReadRetries</code> while the system tries to read the configuration. This is helpful if e.g. a device stops working while startup. Then you can set <code>configReadRetries</code> to 0 to stop FHEM re-trying infinitely.<br>
 			It does not matter whether the configuration reading process is triggered automatically or by <code>get ... config all</code>. The system always considers <code>configReadRetries</code>.<br> 
 			If this attribute is set in the assigned HM485_LAN device, then this value is used by default. This way you can control the behaviour for all HM485 devices.
+		</li>
+		<br>
+		<li><b>stateInterval</b>: Cyclic state query in seconds<br>
+			HMW devices usually report every change of a channel's state by themselves. However, some devices sometimes do not send the message when they switch off by an internal timer (e.g. "on for 90 seconds" triggered by a peered key). FHEM then shows the wrong state until the next change. With <code>stateInterval</code>, FHEM regularly asks the channel for its state, exactly like <code>get &lt;channel&gt; state</code>.<br>
+			The value is the number of seconds between two queries of the same channel. <code>0</code> or not set means off (default). The minimum value is 10.<br>
+			<ul>
+				<li>On a <b>channel</b>, the attribute only affects this channel. The channel is queried even if it does not report its state, so only use it for actor channels.</li>
+				<li>On a <b>device</b>, the attribute applies to all channels of the device which can report their state according to the device description (e.g. switch, blind and dimmer channels, but not key channels). An attribute on a channel overrides the one of the device. Use <code>attr &lt;channel&gt; stateInterval 0</code> to exclude a channel.</li>
+			</ul>
+			All queries of all HM485 devices are sent one after the other with at least 2 seconds in between, spread over the interval. Nothing is sent while the IO-Device is not <code>opened</code>, while the device configuration is being read (<code>configStatus</code> not OK) or when the channel or its device has one of the attributes <code>disable</code>, <code>dummy</code> or <code>ignore</code> set.<br>
+			Example: <code>attr &lt;device&gt; stateInterval 300</code> queries all actor channels of the device every 5 minutes.
 		</li>
 		<br>
 		<li><b>IODev</b>: IO-Device the HM485 device is assigned to<br>
