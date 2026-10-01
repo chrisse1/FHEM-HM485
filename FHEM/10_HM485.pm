@@ -1,9 +1,9 @@
 =head1
 	10_HM485.pm
 
-# $Id: 10_HM485.pm 0816 2019-11-15 14:00:00Z ThorstenPferdekaemper $	
+# $Id: 10_HM485.pm 0817 2026-10-01 20:10:00Z chrisse1 $	
 	
-	Version 0.8.16
+	Version 0.8.17
 				 
 =head1 SYNOPSIS
 	HomeMatic Wired (HM485) Modul for FHEM
@@ -13,6 +13,14 @@
 =head1 DESCRIPTION
 	10_HM485 handle individual HomeMatic Wired (HM485) devices via the
 	00_HM485_LAN interface
+
+=head1 CHANGES
+	0.8.17 (2026-10-01, fork chrisse1/FHEM-HM485)
+	  - Messages to broadcast/group addresses other than FFFFFFFF
+	    (e.g. FF000001, FFFFFF01) update the channel's own readings
+	    (state, working, level...) again instead of only P-readings.
+	  - New attribute stateInterval: cyclic state query of channels.
+	0.8.16 and older: see https://github.com/kc-GitHub/FHEM-HM485
 
 =head1 AUTHOR - Thorsten Pferdekaemper
 =cut
